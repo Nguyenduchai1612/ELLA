@@ -113,13 +113,23 @@ function statusLabel(s) {
 
 const COLUMN_ALIASES = {
   orderId: ["order id", "mã đơn hàng", "order_id", "id đơn hàng", "ma don hang"],
+  // File Đối soát/Income của TikTok gộp chung nhiều LOẠI dòng trong cùng 1
+  // sheet (đơn hàng thật, "GMV thanh toán cho Quảng cáo TikTok", điều chỉnh...).
+  // Cột này giúp lọc ra CHỈ các dòng "Đơn hàng" thật, tránh đếm nhầm dòng
+  // billing quảng cáo thành đơn hàng (làm sai lệch GMV/số đơn/doanh thu).
+  transactionType: ["transaction type", "loại giao dịch", "loai giao dich"],
   sellerSku: ["seller sku", "sku người bán", "sku nguoi ban", "sku"],
   skuId: ["sku id", "id sku"],
   productName: ["tên sản phẩm", "ten san pham", "product name"],
   // Ưu tiên "before discount" (giá trị khởi tạo) cho GMV; "after discount" và các biến thể
   // khác được giữ làm phương án dự phòng nếu file không có cột "before discount".
   subtotal: ["sku subtotal before discount", "subtotal before discount", "subtotal", "thành tiền", "thanh tien", "giá trị đơn hàng", "gia tri don hang", "sku subtotal after discount", "giá bán", "gia ban"],
-  shippingFee: ["shipping fee", "phí vận chuyển", "phi van chuyen"],
+  // "Phí vận chuyển của người bán" là tên cột THẬT trong file Đối soát/Income
+  // của TikTok Seller Center (phí logistics trừ vào người bán). Trước đây chỉ có
+  // alias "phí vận chuyển" (2 từ) trong khi cột thật dài hơn — vì trường này ở
+  // chế độ exact-match (EXACT_ONLY_FIELDS) nên KHÔNG BAO GIỜ khớp được, khiến
+  // phí vận chuyển luôn bị tính = 0đ dù file có dữ liệu thật.
+  shippingFee: ["shipping fee", "phí vận chuyển", "phi van chuyen", "phí vận chuyển của người bán", "phi van chuyen cua nguoi ban"],
   transactionFee: ["transaction fee", "phí giao dịch", "phi giao dich"],
   commissionFee: ["tiktok shop commission fee", "commission fee", "phí hoa hồng", "phi hoa hong", "phí cố định", "phi co dinh"],
   affiliateCommission: ["affiliate commission", "hoa hồng tiếp thị liên kết", "hoa hong affiliate", "phí affiliate", "phi affiliate"],
@@ -156,7 +166,7 @@ function normalizeHeader(h) {
  * "Shipping Fee After Discount" (phí ship buyer trả) chứa sẵn cụm "shipping
  * fee" nhưng KHÔNG phải là phí sàn trừ vào người bán như cột "Shipping Fee"
  * trong file Đối soát thật. Khớp mờ sẽ khiến chi phí bị tính sai/thổi phồng. */
-const EXACT_ONLY_FIELDS = new Set(["shippingFee"]);
+const EXACT_ONLY_FIELDS = new Set(["shippingFee", "transactionType"]);
 
 /**
  * Khớp cột theo 2 vòng: (1) khớp CHÍNH XÁC trước — tránh trường hợp một cột
@@ -270,11 +280,35 @@ function fixSheetRange(sheet) {
   }
 }
 
+/** Nhiều file xuất từ Seller Center (đặc biệt file Đối soát/Statement of
+ * Account/Income) có NHIỀU sheet trong cùng 1 workbook — vd: "Chi tiết đơn
+ * hàng", "Báo cáo", "Lịch sử rút tiền", "Giải thích về phí". Chỉ sheet đầu
+ * tiên (thường là "Chi tiết đơn hàng"/"Order Detail") chứa dữ liệu từng dòng
+ * cần để tính phí sàn; các sheet còn lại là tổng hợp/tài liệu tham khảo và
+ * không có cấu trúc dòng-đơn-hàng nên KHÔNG được đọc làm dữ liệu đơn hàng.
+ * Trước đây hệ thống luôn lấy `wb.SheetNames[0]` theo VỊ TRÍ — nếu TikTok đổi
+ * thứ tự sheet giữa các lần xuất, hệ thống sẽ âm thầm đọc nhầm sheet tổng hợp
+ * (vd: "Báo cáo") và fail import mà không rõ lý do. Hàm dưới đây tìm sheet
+ * theo TÊN trước, chỉ fallback về sheet đầu tiên nếu không tên nào khớp. */
+const DETAIL_SHEET_NAME_HINTS = [
+  "chi tiết đơn hàng", "chi tiet don hang", "order detail", "order details", "chi tiết đơn hàng/điều chỉnh",
+];
+const NON_DETAIL_SHEET_NAME_HINTS = ["báo cáo", "bao cao", "report", "lịch sử rút tiền", "lich su rut tien", "giải thích", "giai thich"];
+
+function pickDetailSheetName(sheetNames) {
+  const norms = sheetNames.map(normalizeHeader);
+  const hintIdx = norms.findIndex((n) => DETAIL_SHEET_NAME_HINTS.some((h) => n.includes(h)));
+  if (hintIdx !== -1) return sheetNames[hintIdx];
+  const nonDetailIdx = norms.findIndex((n) => NON_DETAIL_SHEET_NAME_HINTS.some((h) => n.includes(h)));
+  const fallbackIdx = nonDetailIdx === 0 && sheetNames.length > 1 ? 1 : 0;
+  return sheetNames[fallbackIdx];
+}
+
 /** Đọc 1 file xlsx/csv ở client-side, trả về { headers, rows } */
 async function readSpreadsheet(file) {
   const buf = await file.arrayBuffer();
   const wb = XLSX.read(buf, { type: "array", cellDates: true });
-  const sheetName = wb.SheetNames[0];
+  const sheetName = pickDetailSheetName(wb.SheetNames);
   const sheet = wb.Sheets[sheetName];
   fixSheetRange(sheet);
   const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: "" });
@@ -311,6 +345,15 @@ function parseSettlementRows(headers, rows, platform, skuConfigMap) {
     // header trong nhiều file xuất từ TikTok Seller Center: Order ID thật của
     // TikTok luôn là một chuỗi số thuần.
     if (platform === PLATFORM.TIKTOK && !looksLikeNumericId(orderId)) return;
+    // File Đối soát/Income có thể chứa các dòng KHÔNG PHẢI đơn hàng thật (vd:
+    // "GMV thanh toán cho Quảng cáo TikTok" — phí quảng cáo bị trừ trực tiếp
+    // từ số dư, không phải doanh thu bán hàng) nhưng ID của các dòng này vẫn
+    // là chuỗi số thuần nên không bị lọc bởi looksLikeNumericId ở trên. Nếu
+    // file có cột "Loại giao dịch", chỉ giữ lại các dòng thực sự là "Đơn hàng".
+    if (map.transactionType !== undefined) {
+      const txType = normalizeHeader(row[map.transactionType]);
+      if (txType && !txType.includes("đơn hàng") && !txType.includes("don hang")) return;
+    }
 
     const sellerSku = map.sellerSku !== undefined ? String(row[map.sellerSku] ?? "").trim() : "";
     const subtotal = map.subtotal !== undefined ? toNumber(row[map.subtotal]) : 0;
@@ -2530,6 +2573,51 @@ const initialState = {
   dateRange: { start: "", end: "" },
 };
 
+/**
+ * Gộp 1 đơn hàng đã có trong state (từ lần import trước, vd: file "Tất cả
+ * đơn hàng") với bản ghi mới parse được (vd: từ file Đối soát/Statement of
+ * Account/Income) khi CÙNG Order ID.
+ *
+ * TRƯỚC ĐÂY: reducer dùng `existing.set(o.id, o)` — GHI ĐÈ TOÀN BỘ đơn hàng
+ * cũ bằng bản ghi mới. File Đối soát không có cột SKU/Subtotal (chỉ có phí +
+ * số tiền quyết toán cấp đơn hàng), nên nếu import file Đối soát SAU file
+ * "Tất cả đơn hàng", toàn bộ items/GMV/giá vốn của đơn sẽ bị XÓA SẠCH dù phí
+ * sàn đúng. Ngược lại nếu import file Đối soát TRƯỚC, sau đó import lại file
+ * "Tất cả đơn hàng" (vốn không có cột phí), phí sàn vừa nhập sẽ bị XÓA MẤT về
+ * 0đ — đúng hiện tượng "Tổng phí sàn tự nhiên về 0" mà người dùng gặp phải.
+ *
+ * QUY TẮC GỘP: với từng trường, ưu tiên giá trị "có ý nghĩa" (khác 0/rỗng) từ
+ * CẢ 2 bản ghi thay vì để bản ghi mới ghi đè trắng trơn bản ghi cũ.
+ */
+function mergeOrderRecords(oldOrd, newOrd) {
+  if (!oldOrd) return newOrd;
+  const items = newOrd.items.length > 0 ? newOrd.items : oldOrd.items;
+  const gmv = newOrd.gmv > 0 ? newOrd.gmv : oldOrd.gmv;
+  const cogsTotal = items === newOrd.items ? newOrd.cogsTotal : oldOrd.cogsTotal;
+  const fees = {};
+  const feeFields = new Set([...Object.keys(oldOrd.fees || {}), ...Object.keys(newOrd.fees || {})]);
+  feeFields.forEach((f) => {
+    fees[f] = Math.max(oldOrd.fees?.[f] || 0, newOrd.fees?.[f] || 0);
+  });
+  const feesTotal = Object.values(fees).reduce((s, v) => s + v, 0);
+  const settlementAmount = Math.max(oldOrd.settlementAmount || 0, newOrd.settlementAmount || 0);
+  return {
+    ...oldOrd,
+    ...newOrd,
+    items,
+    gmv,
+    cogsTotal,
+    fees,
+    feesTotal,
+    settlementAmount,
+    // Trạng thái đơn (hủy/hoàn) do file trả hàng cập nhật riêng qua IMPORT_RETURNS
+    // — giữ nguyên trạng thái đã biết thay vì để file Đối soát (thường không có
+    // cột trạng thái đáng tin cậy) ghi đè về "Thành công" mặc định.
+    status: oldOrd.status,
+    date: oldOrd.date || newOrd.date,
+  };
+}
+
 function skuConfigToMap(list) {
   const m = new Map();
   list.forEach((e) => m.set(e.sku.toLowerCase(), e));
@@ -2541,7 +2629,7 @@ function reducer(state, action) {
     case "IMPORT_SETTLEMENT": {
       const { platform, orders, warnings, fileName } = action.payload;
       const existing = new Map(state.orders[platform].map((o) => [o.id, o]));
-      orders.forEach((o) => existing.set(o.id, o));
+      orders.forEach((o) => existing.set(o.id, mergeOrderRecords(existing.get(o.id), o)));
       const log = {
         id: uid("log"),
         time: new Date().toLocaleString("vi-VN"),

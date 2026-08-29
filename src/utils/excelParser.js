@@ -59,6 +59,71 @@ function sum(values) {
   }, 0);
 }
 
+/** Order ID / SKU ID thật của TikTok luôn là chuỗi số thuần, độ dài lớn.
+ * Dùng để loại các dòng "rác" (nhãn hướng dẫn, dòng "Bắt buộc"/"V4"...)
+ * nằm xen giữa header và dữ liệu thật trong các file Seller Center. */
+function looksLikeNumericId(value) {
+  const s = cleanString(value);
+  return /^\d{4,}$/.test(s);
+}
+
+/** Các nhãn "rác" thường gặp trong file Batch Edit Template của TikTok Seller
+ * Center (dòng phiên bản, dòng bắt buộc/không bắt buộc, dòng không thể chỉnh
+ * sửa...). Dùng làm lưới an toàn phụ, bên cạnh kiểm tra ID số ở trên. */
+const METADATA_MARKER_VALUES = new Set(
+  [
+    "v4",
+    "metric",
+    "bat buoc",
+    "khong bat buoc",
+    "khong the chinh sua",
+    "required",
+    "not required",
+    "cannot be edited",
+  ].map(normalizeText)
+);
+
+function isMetadataRow(rowObject) {
+  const values = Object.values(rowObject || {}).map(cleanString);
+  const nonEmpty = values.filter((v) => v !== "");
+
+  if (!nonEmpty.length) {
+    return true;
+  }
+
+  const markerHits = nonEmpty.filter((v) =>
+    METADATA_MARKER_VALUES.has(normalizeText(v))
+  ).length;
+
+  return markerHits > 0 && markerHits >= nonEmpty.length / 2;
+}
+
+/**
+ * Nhiều giao dịch trong file Quyết toán/Income của TikTok KHÔNG PHẢI là đơn
+ * hàng bán (vd: "GMV thanh toán cho Quảng cáo TikTok" — tiền quảng cáo bị trừ,
+ * "Rút tiền"...). Nếu để lọt các dòng này vào doanh thu/đơn hàng sẽ làm sai
+ * lệch nghiêm trọng số liệu tài chính. Cần loại trừ tường minh.
+ */
+const NON_ORDER_TRANSACTION_SUBSTRINGS = [
+  "quangcao", // "Quảng cáo"
+  "advertising",
+  "ruttien", // "Rút tiền"
+  "withdrawal",
+  "adjustment".replace(/[^a-z]/g, ""),
+];
+
+function isNonOrderTransactionValue(rawValue) {
+  const normalized = normalizeText(rawValue);
+
+  if (!normalized) {
+    return false;
+  }
+
+  return NON_ORDER_TRANSACTION_SUBSTRINGS.some((needle) =>
+    normalized.includes(needle)
+  );
+}
+
 /* =========================================================
  * PLATFORM HELPERS
  * ========================================================= */
@@ -161,18 +226,85 @@ function findColumn(row, aliases = []) {
   return null;
 }
 
+/** Giống findColumn nhưng phân biệt được "không tìm thấy cột" (null) với
+ * "cột có tồn tại nhưng giá trị rỗng" (""), dùng để kiểm tra sự tồn tại của
+ * một cột (vd: kiểm tra file Ads có cột Doanh thu hay không). */
+function hasColumn(row, aliases = []) {
+  return findColumn(row, aliases) !== null;
+}
+
+/* =========================================================
+ * SHEET RANGE FIX
+ *
+ * QUAN TRỌNG: nhiều file xuất từ TikTok Seller Center (đặc biệt là Batch Edit
+ * Template) khai báo sai vùng dữ liệu "!ref" trong XML — ví dụ khai "A1:AL5"
+ * trong khi dữ liệu sản phẩm thật nằm tới hàng thứ hàng trăm. Nếu dùng thẳng
+ * XLSX.utils.sheet_to_json, SheetJS sẽ CẮT MẤT toàn bộ dữ liệu thật một cách
+ * âm thầm (không báo lỗi). Phải quét lại toàn bộ ô thực tế có trong sheet để
+ * tính đúng phạm vi trước khi chuyển sang JSON.
+ * ========================================================= */
+
+function fixSheetRange(worksheet) {
+  if (!worksheet) {
+    return;
+  }
+
+  let maxRow = -1;
+  let maxCol = -1;
+
+  Object.keys(worksheet).forEach((key) => {
+    if (key[0] === "!") {
+      return;
+    }
+
+    const match = key.match(/^([A-Z]+)(\d+)$/);
+
+    if (!match) {
+      return;
+    }
+
+    const col = XLSX.utils.decode_col(match[1]);
+    const row = parseInt(match[2], 10) - 1;
+
+    if (row > maxRow) maxRow = row;
+    if (col > maxCol) maxCol = col;
+  });
+
+  if (maxRow < 0) {
+    return;
+  }
+
+  const declared = worksheet["!ref"]
+    ? XLSX.utils.decode_range(worksheet["!ref"])
+    : null;
+
+  const endRow = declared ? Math.max(declared.e.r, maxRow) : maxRow;
+  const endCol = declared ? Math.max(declared.e.c, maxCol) : maxCol;
+
+  if (!declared || declared.e.r < maxRow || declared.e.c < maxCol) {
+    worksheet["!ref"] = XLSX.utils.encode_range({
+      s: { r: 0, c: 0 },
+      e: { r: endRow, c: endCol },
+    });
+  }
+}
+
 /* =========================================================
  * HEADER ROW DETECTION
  *
  * TikTok Seller Center có thể có:
  *
- * Row 0: product_id
- * Row 1: metric
- * Row 2: hướng dẫn
- * Row 3: hướng dẫn
- * Row 4+: header thật
+ * Row 0: product_id (header máy đọc thật)
+ * Row 1: V4 / metric (dòng phiên bản)
+ * Row 2: hướng dẫn tiếng Việt
+ * Row 3: Bắt buộc / Không bắt buộc
+ * Row 4: mô tả chi tiết từng cột
+ * Row 5+: dữ liệu thật
  *
- * Parser sẽ quét tối đa 10 dòng đầu.
+ * Parser sẽ quét tối đa 10 dòng đầu để tìm đúng dòng header, SAU ĐÓ còn phải
+ * lọc tiếp các dòng "rác" nằm xen giữa header và dữ liệu thật (xem
+ * isMetadataRow / looksLikeNumericId ở trên) vì chúng vẫn có nội dung nên
+ * không tự động bị loại chỉ bằng việc tìm đúng header.
  * ========================================================= */
 
 const HEADER_DETECTION_GROUPS = {
@@ -217,28 +349,6 @@ const HEADER_DETECTION_GROUPS = {
     "order status",
   ],
 };
-
-function rowContainsHeaderAlias(
-  row,
-  aliases
-) {
-  if (!Array.isArray(row)) {
-    return false;
-  }
-
-  const normalizedCells = row.map(
-    normalizeText
-  );
-
-  const normalizedAliases = aliases.map(
-    normalizeText
-  );
-
-  return normalizedAliases.some(
-    (alias) =>
-      normalizedCells.includes(alias)
-  );
-}
 
 function scoreHeaderRow(row) {
   if (!Array.isArray(row)) {
@@ -448,6 +558,10 @@ function rawRowsToObjects(
 function convertWorksheetToDetectedRows(
   worksheet
 ) {
+  // FIX QUAN TRỌNG: vá lại vùng dữ liệu bị khai sai TRƯỚC khi đọc, nếu không
+  // các dòng ở cuối sheet (thường là toàn bộ sản phẩm thật) sẽ bị cắt mất.
+  fixSheetRange(worksheet);
+
   const rawRows =
     XLSX.utils.sheet_to_json(
       worksheet,
@@ -474,11 +588,18 @@ function convertWorksheetToDetectedRows(
     };
   }
 
-  const rows =
+  const rawObjectRows =
     rawRowsToObjects(
       rawRows,
       headerInfo.index
     );
+
+  // Lọc tiếp các dòng "rác" (hướng dẫn, dòng Bắt buộc/Không bắt buộc, dòng
+  // phiên bản V4/metric...) nằm xen giữa header và dữ liệu thật — các dòng
+  // này có nội dung nên không bị loại chỉ nhờ tìm đúng header ở bước trên.
+  const rows = rawObjectRows.filter(
+    (row) => !isMetadataRow(row)
+  );
 
   return {
     rows,
@@ -539,17 +660,6 @@ export async function readExcelFile(file) {
 
 /* =========================================================
  * SHEET -> ROWS
- *
- * QUAN TRỌNG:
- * Không còn mặc định row 0 là header.
- *
- * Parser quét 10 dòng đầu để tìm:
- *
- * - seller_sku
- * - sku_id
- * - id đơn hàng/điều chỉnh
- * - loại giao dịch
- * - tổng số tiền quyết toán
  * ========================================================= */
 
 export function sheetToRows(
@@ -589,8 +699,6 @@ export function sheetToRows(
 
 /* =========================================================
  * READ ALL SHEETS
- *
- * Mỗi sheet đều được scan header độc lập.
  * ========================================================= */
 
 export function workbookToRows(
@@ -624,6 +732,62 @@ export function workbookToRows(
       return detected.rows;
     }
   );
+}
+
+/**
+ * Giống workbookToRows nhưng trả thêm loại header đã nhận diện được
+ * ("settlement" | "orders" | "sku" | null) — dùng để tự động phân luồng 1 file
+ * "Đơn hàng & Quyết toán" duy nhất tới đúng bộ xử lý (vì trên thực tế, file
+ * "Tất cả đơn hàng" (per-SKU) và file "Income/Quyết toán" (per-order, có phí
+ * chi tiết) có cấu trúc khác hẳn nhau nhưng cùng được thả vào 1 ô upload).
+ */
+export function detectWorkbookRows(
+  workbook,
+  options = {}
+) {
+  if (
+    !workbook ||
+    !Array.isArray(workbook.SheetNames)
+  ) {
+    return { rows: [], headerType: null, headerScore: 0 };
+  }
+
+  const selectedSheets = options.sheetName
+    ? [options.sheetName]
+    : workbook.SheetNames;
+
+  const sheetResults = selectedSheets.map(
+    (sheetName) => {
+      const worksheet = workbook.Sheets[sheetName];
+
+      if (!worksheet) {
+        return {
+          rows: [],
+          rawRows: [],
+          headerIndex: -1,
+          headerType: null,
+          headerScore: 0,
+        };
+      }
+
+      return convertWorksheetToDetectedRows(worksheet);
+    }
+  );
+
+  const rows = sheetResults.flatMap((result) => result.rows);
+
+  const best = sheetResults.reduce((acc, result) => {
+    if (!acc || result.headerScore > acc.headerScore) {
+      return result;
+    }
+    return acc;
+  }, null);
+
+  return {
+    rows,
+    headerType: best?.headerType ?? null,
+    headerScore: best?.headerScore ?? 0,
+  };
 }
 
 /* =========================================================
@@ -688,6 +852,29 @@ function getOrderStatus(row) {
   );
 }
 
+/**
+ * "Loại giao dịch" trong file Quyết toán/Income của TikTok chỉ phân biệt
+ * LOẠI giao dịch (vd: "Đơn hàng", "GMV thanh toán cho Quảng cáo TikTok"),
+ * KHÔNG PHẢI trạng thái giao hàng/hủy/hoàn thật. Nếu giá trị chỉ là nhãn loại
+ * giao dịch chung chung "Đơn hàng" thì KHÔNG dùng nó để suy ra trạng thái —
+ * trả về null để nơi gọi ưu tiên dùng trạng thái thật từ file Đơn hàng gốc
+ * (Order Status / Cancelation Type) nếu có, tránh ghi đè sai.
+ */
+function getSettlementStatus(row) {
+  const raw = findColumn(row, STATUS_ALIASES);
+  const normalized = normalizeText(raw);
+
+  if (!normalized) {
+    return null;
+  }
+
+  if (normalized === normalizeText("Đơn hàng")) {
+    return null;
+  }
+
+  return normalizeOrderStatus(raw);
+}
+
 /* =========================================================
  * SKU
  * ========================================================= */
@@ -719,6 +906,24 @@ function getSKU(row) {
       row,
       SKU_ALIASES
     )
+  );
+}
+
+/** Cột ID nội bộ (product_id/sku_id) — CHỈ dùng để kiểm tra 1 dòng có phải là
+ * dữ liệu thật hay không (ID nội bộ của TikTok luôn là chuỗi số dài), tách
+ * biệt với getSKU() (lấy mã SKU người bán để hiển thị/đối chiếu giá vốn). */
+const INTERNAL_ID_ALIASES = [
+  "sku_id",
+  "sku id",
+  "id sku",
+  "product_id",
+  "id sản phẩm",
+  "id san pham",
+];
+
+function getInternalId(row) {
+  return cleanString(
+    findColumn(row, INTERNAL_ID_ALIASES)
   );
 }
 
@@ -960,10 +1165,64 @@ const DATE_ALIASES = [
   "Ngay",
   "Thời gian",
   "Thoi gian",
+  "Thời gian tạo đơn hàng",
   "Settlement Date",
   "Settlement date",
   "Ngày quyết toán",
   "Ngay quyet toan",
+  "Thời gian quyết toán đơn hàng",
+];
+
+/* =========================================================
+ * RETURN / REFUND
+ * ========================================================= */
+
+const RETURN_STATUS_ALIASES = [
+  "Return Status",
+  "Return status",
+  "Trạng thái hoàn tiền",
+  "Trang thai hoan tien",
+  "Trạng thái trả hàng",
+  "Trang thai tra hang",
+  "Trạng thái hoàn hàng",
+];
+
+const RETURN_REASON_ALIASES = [
+  "Return Reason",
+  "Return reason",
+  "Lý do hoàn",
+  "Ly do hoan",
+  "Lý do trả hàng",
+  "Ly do tra hang",
+];
+
+/* =========================================================
+ * ADS
+ * ========================================================= */
+
+const ADS_COST_ALIASES = [
+  "Cost",
+  "Amount Spent",
+  "Spend",
+  "Total Cost",
+  "Chi phí",
+  "Chi phí quảng cáo",
+  "Ad Spend",
+];
+
+const ADS_REVENUE_ALIASES = [
+  "Revenue",
+  "Attributed Revenue",
+  "GMV From Ads",
+  "Gross Revenue",
+  "Doanh thu từ quảng cáo",
+  "Doanh thu",
+];
+
+const ADS_CAMPAIGN_ALIASES = [
+  "Campaign",
+  "Campaign Name",
+  "Tên chiến dịch",
 ];
 
 /* =========================================================
@@ -1033,7 +1292,8 @@ function normalizeOrderItem(
 
 export function normalizeOrderRows(
   rows = [],
-  platform = getTikTokPlatform()
+  platform = getTikTokPlatform(),
+  stats = null
 ) {
   if (!Array.isArray(rows)) {
     return [];
@@ -1049,6 +1309,15 @@ export function normalizeOrderRows(
       getOrderId(row);
 
     if (!orderId) {
+      return;
+    }
+
+    const rawStatusValue = findColumn(row, STATUS_ALIASES);
+
+    if (isNonOrderTransactionValue(rawStatusValue)) {
+      if (stats) {
+        stats.skippedNonOrder = (stats.skippedNonOrder || 0) + 1;
+      }
       return;
     }
 
@@ -1204,6 +1473,7 @@ const TIKTOK_FEE_ALIASES = {
     "Platform Commission",
     "Phí hoa hồng",
     "Phi hoa hong",
+    "Phí hoa hồng của TikTok Shop",
   ],
 
   transactionFee: [
@@ -1222,6 +1492,7 @@ const TIKTOK_FEE_ALIASES = {
     "TikTok Shop service fee",
     "Phí dịch vụ",
     "Phi dich vu",
+    "Phí dịch vụ SFP",
   ],
 
   paymentFee: [
@@ -1241,6 +1512,7 @@ const TIKTOK_FEE_ALIASES = {
     "TikTok Shipping Fee",
     "Phí vận chuyển",
     "Phi van chuyen",
+    "Phí vận chuyển của người bán",
   ],
 
   returnShippingFee: [
@@ -1250,6 +1522,7 @@ const TIKTOK_FEE_ALIASES = {
     "Reverse Shipping Fee",
     "Phí vận chuyển hoàn",
     "Phi van chuyen hoan",
+    "Phí vận chuyển trả hàng thực tế",
   ],
 
   affiliateFee: [
@@ -1259,6 +1532,7 @@ const TIKTOK_FEE_ALIASES = {
     "Affiliate commission fee",
     "Phí tiếp thị liên kết",
     "Phi tiep thi lien ket",
+    "Hoa hồng liên kết",
   ],
 
   advertisingFee: [
@@ -1276,6 +1550,7 @@ const TIKTOK_FEE_ALIASES = {
     "VAT Withheld",
     "VAT withheld",
     "VAT",
+    "Thuế GTGT do TikTok Shop khấu trừ",
   ],
 
   taxWithheld: [
@@ -1284,6 +1559,20 @@ const TIKTOK_FEE_ALIASES = {
     "Income Tax Withheld",
     "Thuế",
     "Thue",
+    "Thuế TNCN do TikTok Shop khấu trừ",
+  ],
+
+  orderProcessingFee: [
+    "Order Processing Fee",
+    "Order processing fee",
+    "Phí xử lý đơn hàng",
+    "Phi xu ly don hang",
+  ],
+
+  voucherXtraFee: [
+    "Voucher Xtra",
+    "Voucher Xtra Fee",
+    "Phí dịch vụ Voucher Xtra",
   ],
 
   otherFee: [
@@ -1367,6 +1656,16 @@ const SHOPEE_FEE_ALIASES = {
     "Thue",
   ],
 
+  orderProcessingFee: [
+    "Order Processing Fee",
+    "Phí xử lý đơn hàng",
+  ],
+
+  voucherXtraFee: [
+    "Voucher Xtra",
+    "Phí Voucher Xtra",
+  ],
+
   otherFee: [
     "Other Fee",
     "Other Fees",
@@ -1411,19 +1710,9 @@ function normalizePlatformFees(
 
   fees.currency = "VND";
 
-  const totalFee = sum([
-    fees.commissionFee,
-    fees.transactionFee,
-    fees.serviceFee,
-    fees.paymentFee,
-    fees.shippingFee,
-    fees.returnShippingFee,
-    fees.affiliateFee,
-    fees.advertisingFee,
-    fees.vatWithheld,
-    fees.taxWithheld,
-    fees.otherFee,
-  ]);
+  const totalFee = sum(
+    Object.keys(aliases).map((field) => fees[field])
+  );
 
   fees.totalFee =
     totalFee;
@@ -1439,7 +1728,8 @@ function normalizePlatformFees(
 
 export function normalizeSettlementRows(
   rows = [],
-  platform = getTikTokPlatform()
+  platform = getTikTokPlatform(),
+  stats = null
 ) {
   if (!Array.isArray(rows)) {
     return [];
@@ -1456,6 +1746,18 @@ export function normalizeSettlementRows(
       getOrderId(row);
 
     if (!orderId) {
+      return;
+    }
+
+    const rawStatusValue = findColumn(row, STATUS_ALIASES);
+
+    if (isNonOrderTransactionValue(rawStatusValue)) {
+      if (stats) {
+        stats.skippedNonOrder = (stats.skippedNonOrder || 0) + 1;
+        stats.nonOrderAmount =
+          (stats.nonOrderAmount || 0) +
+          toNumber(findColumn(row, SETTLEMENT_ALIASES));
+      }
       return;
     }
 
@@ -1478,8 +1780,11 @@ export function normalizeSettlementRows(
         normalizedPlatform
       );
 
+    // Chỉ dùng "Loại giao dịch" làm trạng thái khi nó thực sự mang ý nghĩa
+    // trạng thái (hủy/hoàn); nhãn chung "Đơn hàng" không được coi là trạng
+    // thái để tránh ghi đè nhầm trạng thái thật lấy từ file Đơn hàng gốc.
     const status =
-      getOrderStatus(row);
+      getSettlementStatus(row);
 
     if (
       !settlementMap.has(key)
@@ -1545,14 +1850,8 @@ export function normalizeSettlementRows(
 
     existing.rows += 1;
 
-    if (
-      existing.status ===
-        ORDER_STATUS.DELIVERED &&
-      status !==
-        ORDER_STATUS.DELIVERED
-    ) {
-      existing.status =
-        status;
+    if (!existing.status && status) {
+      existing.status = status;
     }
   });
 
@@ -1560,52 +1859,20 @@ export function normalizeSettlementRows(
     settlementMap.values()
   ).map(
     (settlement) => {
+      const feeFieldNames = Object.keys(
+        settlement.platformFees || {}
+      ).filter(
+        (field) =>
+          typeof settlement.platformFees[field] === "number" &&
+          field !== "totalFee"
+      );
+
       settlement.platformFees.totalFee =
-        sum([
-          settlement
-            .platformFees
-            .commissionFee,
-
-          settlement
-            .platformFees
-            .transactionFee,
-
-          settlement
-            .platformFees
-            .serviceFee,
-
-          settlement
-            .platformFees
-            .paymentFee,
-
-          settlement
-            .platformFees
-            .shippingFee,
-
-          settlement
-            .platformFees
-            .returnShippingFee,
-
-          settlement
-            .platformFees
-            .affiliateFee,
-
-          settlement
-            .platformFees
-            .advertisingFee,
-
-          settlement
-            .platformFees
-            .vatWithheld,
-
-          settlement
-            .platformFees
-            .taxWithheld,
-
-          settlement
-            .platformFees
-            .otherFee,
-        ]);
+        sum(
+          feeFieldNames.map(
+            (field) => settlement.platformFees[field]
+          )
+        );
 
       return settlement;
     }
@@ -1614,6 +1881,15 @@ export function normalizeSettlementRows(
 
 /* =========================================================
  * MERGE ORDERS + SETTLEMENTS
+ *
+ * Trên thực tế, file "Đơn hàng" (per-SKU, có COGS) và file "Quyết toán/Income"
+ * (per-order, có phí sàn thật) thường KHÔNG cùng phạm vi thời gian/số lượng
+ * đơn — nên hàm này phải xử lý cả 2 chiều:
+ *  - Đơn có trong file Đơn hàng nhưng CHƯA có Quyết toán -> giữ nguyên, phí
+ *    sàn = 0 (đúng bản chất: chưa có dữ liệu phí thật).
+ *  - Đơn CHỈ có trong file Quyết toán (chưa có SKU chi tiết) -> vẫn phải giữ
+ *    lại (không được bỏ sót doanh thu/phí thật đã ghi nhận), items để trống
+ *    và COGS sẽ = 0 cho tới khi có file Đơn hàng khớp Order ID bổ sung.
  * ========================================================= */
 
 export function mergeOrdersWithSettlements(
@@ -1634,7 +1910,9 @@ export function mergeOrdersWithSettlements(
     }
   );
 
-  return orders.map(
+  const usedSettlementKeys = new Set();
+
+  const mergedFromOrders = orders.map(
     (order) => {
       const key = `${order.platform}_${order.orderId}`;
 
@@ -1653,12 +1931,17 @@ export function mergeOrdersWithSettlements(
         };
       }
 
+      usedSettlementKeys.add(key);
+
       return {
         ...order,
 
+        // Ưu tiên trạng thái THẬT lấy từ file Đơn hàng gốc (Order Status /
+        // Cancelation Type) — chỉ dùng trạng thái suy ra từ Quyết toán khi
+        // file Đơn hàng không xác định được (xem getSettlementStatus()).
         orderStatus:
-          settlement.status ||
-          order.orderStatus,
+          order.orderStatus ||
+          settlement.status,
 
         settlementAmount:
           settlement
@@ -1670,6 +1953,28 @@ export function mergeOrdersWithSettlements(
       };
     }
   );
+
+  // Đơn chỉ tồn tại trong file Quyết toán (chưa có dữ liệu SKU tương ứng) —
+  // vẫn giữ lại để không mất doanh thu/phí thật đã ghi nhận.
+  const settlementOnlyOrders = settlements
+    .filter((settlement) => {
+      const key = `${settlement.platform}_${settlement.orderId}`;
+      return !usedSettlementKeys.has(key);
+    })
+    .map((settlement) =>
+      createOrder({
+        platform: settlement.platform,
+        orderId: settlement.orderId,
+        orderStatus: settlement.status,
+        orderDate: "",
+        settlementAmount: settlement.settlementAmount,
+        items: [],
+        platformFees: settlement.platformFees,
+        missingSkuData: true,
+      })
+    );
+
+  return [...mergedFromOrders, ...settlementOnlyOrders];
 }
 
 /* =========================================================
@@ -1777,20 +2082,199 @@ export async function parseShopeeSettlement(
 }
 
 /* =========================================================
- * SKU BATCH EDIT PARSER
+ * RETURNS / REFUND PARSER
  *
- * Dùng cho:
- *
- * Tiktoksellercenter_batchedit_...
- *
- * Header có thể là:
- *
- * seller_sku
- * sku_id
- * product_name
- * quantity
- *
+ * CHỈ đánh dấu 1 đơn là "Hoàn trả" khi Return Status đã thực sự hoàn tất —
+ * các yêu cầu bị từ chối/hủy (Refund rejected, Request Canceled...) KHÔNG
+ * được tính là mất doanh thu vì đơn hàng vẫn giữ nguyên trạng thái bán thành
+ * công trên thực tế.
  * ========================================================= */
+
+export async function parseReturnsFile(
+  file,
+  platform = getTikTokPlatform(),
+  options = {}
+) {
+  const workbook = await readExcelFile(file);
+  const detected = options.sheetName
+    ? { rows: sheetToRows(workbook, options.sheetName) }
+    : detectWorkbookRows(workbook);
+
+  const normalizedPlatform = normalizePlatform(platform);
+  const rows = detected.rows || [];
+
+  let skippedNotCompleted = 0;
+  const records = [];
+  const seen = new Set();
+
+  rows.forEach((row) => {
+    const orderId = getOrderId(row);
+
+    if (!orderId) {
+      return;
+    }
+
+    const rawStatus = findColumn(row, RETURN_STATUS_ALIASES);
+    const normalizedStatus = normalizeText(rawStatus);
+
+    const isRejectedOrCancelled =
+      normalizedStatus.includes("reject") ||
+      normalizedStatus.includes("tuchoi") ||
+      normalizedStatus.includes("huy") ||
+      (normalizedStatus.includes("cancel") &&
+        !normalizedStatus.includes("complet"));
+
+    if (isRejectedOrCancelled) {
+      skippedNotCompleted += 1;
+      return;
+    }
+
+    const key = `${normalizedPlatform}_${orderId}`;
+
+    if (seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+
+    records.push({
+      platform: normalizedPlatform,
+      orderId,
+      reason: cleanString(findColumn(row, RETURN_REASON_ALIASES)),
+      rawStatus: cleanString(rawStatus),
+    });
+  });
+
+  return {
+    platform: normalizedPlatform,
+    records,
+    totalRows: rows.length,
+    skippedNotCompleted,
+  };
+}
+
+/* =========================================================
+ * ADS REPORT PARSER
+ *
+ * File Ads hiện tại (theo cấu trúc phổ biến) thường chỉ có cột Chi phí
+ * (Cost/Spend), KHÔNG có cột Doanh thu do quảng cáo mang lại. Hàm này đọc cả
+ * hai nếu có, và báo rõ ràng "hasRevenueColumn: false" khi thiếu — để nơi gọi
+ * KHÔNG tự bịa số ROAS/CIR khi không có dữ liệu doanh thu thật.
+ * ========================================================= */
+
+export async function parseAdsFile(
+  file,
+  platform = getTikTokPlatform(),
+  options = {}
+) {
+  const workbook = await readExcelFile(file);
+  const detected = options.sheetName
+    ? { rows: sheetToRows(workbook, options.sheetName) }
+    : detectWorkbookRows(workbook);
+
+  const normalizedPlatform = normalizePlatform(platform);
+  const rows = detected.rows || [];
+
+  if (!rows.length) {
+    return {
+      platform: normalizedPlatform,
+      records: [],
+      totalCost: 0,
+      totalRevenue: 0,
+      hasRevenueColumn: false,
+      warning:
+        "Không đọc được dòng dữ liệu nào từ file (không tìm thấy header phù hợp).",
+    };
+  }
+
+  const hasCostColumn = rows.some((row) =>
+    hasColumn(row, ADS_COST_ALIASES)
+  );
+
+  if (!hasCostColumn) {
+    return {
+      platform: normalizedPlatform,
+      records: [],
+      totalCost: 0,
+      totalRevenue: 0,
+      hasRevenueColumn: false,
+      warning:
+        "Không tìm thấy cột Chi phí (Cost/Spend/Chi phí quảng cáo) trong file.",
+    };
+  }
+
+  const hasRevenueColumn = rows.some((row) =>
+    hasColumn(row, ADS_REVENUE_ALIASES)
+  );
+
+  const records = rows
+    .map((row) => ({
+      platform: normalizedPlatform,
+      date: normalizeDate(findColumn(row, DATE_ALIASES)),
+      campaign: cleanString(findColumn(row, ADS_CAMPAIGN_ALIASES)),
+      cost: Math.abs(toNumber(findColumn(row, ADS_COST_ALIASES))),
+      revenue: Math.abs(toNumber(findColumn(row, ADS_REVENUE_ALIASES))),
+    }))
+    .filter((record) => record.cost > 0 || record.revenue > 0);
+
+  return {
+    platform: normalizedPlatform,
+    records,
+    totalCost: records.reduce((total, record) => total + record.cost, 0),
+    totalRevenue: records.reduce((total, record) => total + record.revenue, 0),
+    hasRevenueColumn,
+  };
+}
+
+/* =========================================================
+ * SKU BATCH EDIT PARSER
+ * ========================================================= */
+
+function extractSkuRecords(rows, normalizedPlatform) {
+  return rows
+    .filter((row) => {
+      // Lọc dòng "rác" còn sót lại (hướng dẫn, dòng Bắt buộc/Không bắt buộc)
+      // bằng ID nội bộ dạng số — nếu cột ID nội bộ tồn tại mà giá trị không
+      // phải chuỗi số thì chắc chắn không phải dữ liệu sản phẩm thật.
+      const internalId = getInternalId(row);
+
+      if (internalId) {
+        return looksLikeNumericId(internalId);
+      }
+
+      return Boolean(getSKU(row) || getProductName(row));
+    })
+    .map((row) => {
+      const sku = getSKU(row);
+      const productName = getProductName(row);
+      const availableQty = getAvailableQty(row);
+
+      const cogs = Math.max(
+        0,
+        toNumber(
+          findColumn(row, [
+            "COGS",
+            "Cost",
+            "Unit Cost",
+            "Giá vốn",
+            "Gia von",
+          ])
+        )
+      );
+
+      return {
+        sku,
+        sellerSku: sku,
+        name: productName || sku,
+        productName: productName || sku,
+        cogs,
+        availableQty,
+        AvailableQty: availableQty,
+        platform: normalizedPlatform,
+      };
+    })
+    .filter((record) => Boolean(record.sku));
+}
 
 export async function parseSkuConfigFile(
   file,
@@ -1813,64 +2297,7 @@ export async function parseSkuConfigFile(
   const normalizedPlatform =
     normalizePlatform(platform);
 
-  const records =
-    rows
-      .filter((row) => {
-        return (
-          getSKU(row) ||
-          getProductName(row)
-        );
-      })
-      .map((row) => {
-        const sku =
-          getSKU(row);
-
-        const productName =
-          getProductName(row);
-
-        const availableQty =
-          getAvailableQty(row);
-
-        const cogs = Math.max(
-          0,
-          toNumber(
-            findColumn(row, [
-              "COGS",
-              "Cost",
-              "Unit Cost",
-              "Giá vốn",
-              "Gia von",
-            ])
-          )
-        );
-
-        return {
-          sku,
-          sellerSku: sku,
-
-          name:
-            productName ||
-            sku,
-
-          productName:
-            productName ||
-            sku,
-
-          cogs,
-
-          availableQty,
-
-          AvailableQty:
-            availableQty,
-
-          platform:
-            normalizedPlatform,
-        };
-      })
-      .filter(
-        (record) =>
-          Boolean(record.sku)
-      );
+  const records = extractSkuRecords(rows, normalizedPlatform);
 
   return {
     platform:
@@ -1880,6 +2307,8 @@ export async function parseSkuConfigFile(
 
     skuConfig:
       records,
+
+    totalRowsScanned: rows.length,
 
     inventory:
       records.reduce(
@@ -2088,10 +2517,6 @@ export async function parseAllPlatformFiles({
 
 /* =========================================================
  * DEDUPLICATION
- *
- * PRIMARY KEY:
- *
- * ${Platform}_${OrderID}
  * ========================================================= */
 
 export function deduplicateOrders(
@@ -2277,6 +2702,8 @@ export function deduplicateSettlements(
         "advertisingFee",
         "vatWithheld",
         "taxWithheld",
+        "orderProcessingFee",
+        "voucherXtraFee",
         "otherFee",
         "returnFee",
       ];
@@ -2294,43 +2721,11 @@ export function deduplicateSettlements(
       );
 
       existingFees.totalFee =
-        sum([
-          existingFees
-            .commissionFee,
-
-          existingFees
-            .transactionFee,
-
-          existingFees
-            .serviceFee,
-
-          existingFees
-            .paymentFee,
-
-          existingFees
-            .shippingFee,
-
-          existingFees
-            .returnShippingFee,
-
-          existingFees
-            .affiliateFee,
-
-          existingFees
-            .advertisingFee,
-
-          existingFees
-            .vatWithheld,
-
-          existingFees
-            .taxWithheld,
-
-          existingFees
-            .otherFee,
-
-          existingFees
-            .returnFee,
-        ]);
+        sum(
+          feeFields.map(
+            (field) => existingFees[field]
+          )
+        );
 
       existing.platformFees =
         existingFees;
@@ -2465,9 +2860,7 @@ export function detectPlatformFromRows(
 }
 
 /* =========================================================
- * HEADER INFORMATION
- *
- * Dùng để debug file thực tế.
+ * HEADER INFORMATION (debug)
  * ========================================================= */
 
 export async function inspectExcelStructure(
@@ -2535,17 +2928,6 @@ export async function parseRawExcelFile(
 
 /* =========================================================
  * SMART PARSER
- *
- * parseExcelFile CONTRACT
- *
- * {
- *   platform,
- *   type:
- *     "orders"
- *     | "settlement"
- *     | "sku",
- *   sheetName
- * }
  * ========================================================= */
 
 export async function parseExcelFile(
@@ -2555,49 +2937,9 @@ export async function parseExcelFile(
   const workbook =
     await readExcelFile(file);
 
-  const selectedSheets =
-    options.sheetName
-      ? [
-          options.sheetName,
-        ]
-      : workbook.SheetNames;
-
-  const sheetResults =
-    selectedSheets.map(
-      (sheetName) => {
-        const worksheet =
-          workbook.Sheets[
-            sheetName
-          ];
-
-        if (!worksheet) {
-          return {
-            rows: [],
-            rawRows: [],
-            headerIndex: -1,
-            headerType: null,
-            headerScore: 0,
-          };
-        }
-
-        return convertWorksheetToDetectedRows(
-          worksheet
-        );
-      }
-    );
-
-  const rows =
-    sheetResults.flatMap(
-      (result) =>
-        result.rows
-    );
-
-  const detectedType =
-    sheetResults.find(
-      (result) =>
-        result.headerType
-    )?.headerType ||
-    null;
+  const detected = detectWorkbookRows(workbook, options);
+  const rows = detected.rows;
+  const detectedType = detected.headerType;
 
   const platform =
     options.platform ||
@@ -2629,10 +2971,13 @@ export async function parseExcelFile(
       platform ||
       getTikTokPlatform();
 
+    const stats = { skippedNonOrder: 0, nonOrderAmount: 0 };
+
     const data =
       normalizeSettlementRows(
         rows,
-        settlementPlatform
+        settlementPlatform,
+        stats
       );
 
     return {
@@ -2647,6 +2992,8 @@ export async function parseExcelFile(
 
       settlements:
         data,
+
+      stats,
     };
   }
 
@@ -2655,61 +3002,7 @@ export async function parseExcelFile(
       platform ||
       getTikTokPlatform();
 
-    const records =
-      rows
-        .filter(
-          (row) =>
-            getSKU(row)
-        )
-        .map(
-          (row) => ({
-            sku: getSKU(row),
-
-            sellerSku:
-              getSKU(row),
-
-            name:
-              getProductName(
-                row
-              ) ||
-              getSKU(row),
-
-            productName:
-              getProductName(
-                row
-              ) ||
-              getSKU(row),
-
-            cogs: Math.max(
-              0,
-              toNumber(
-                findColumn(
-                  row,
-                  [
-                    "COGS",
-                    "Cost",
-                    "Unit Cost",
-                    "Giá vốn",
-                    "Gia von",
-                  ]
-                )
-              )
-            ),
-
-            availableQty:
-              getAvailableQty(
-                row
-              ),
-
-            AvailableQty:
-              getAvailableQty(
-                row
-              ),
-
-            platform:
-              skuPlatform,
-          })
-        );
+    const records = extractSkuRecords(rows, skuPlatform);
 
     return {
       platform:
@@ -2745,10 +3038,13 @@ export async function parseExcelFile(
     platform ||
     getTikTokPlatform();
 
+  const stats = { skippedNonOrder: 0 };
+
   const data =
     normalizeOrderRows(
       rows,
-      orderPlatform
+      orderPlatform,
+      stats
     );
 
   return {
@@ -2762,6 +3058,8 @@ export async function parseExcelFile(
     data,
 
     orders: data,
+
+    stats,
   };
 }
 

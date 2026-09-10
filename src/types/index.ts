@@ -7,10 +7,10 @@ export interface Address {
   id: string;
   fullName: string;
   phone: string;
-  province: string;
-  district: string;
+  addressLine: string; // <-- Bổ sung hoặc đổi tên thuộc tính này thành addressLine
   ward: string;
-  detailAddress: string;
+  district: string;
+  province: string;
   isDefault?: boolean;
 }
 

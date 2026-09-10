@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  @apply bg-neutral-50 text-neutral-900 antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Consistent focus ring across the whole storefront (Section 40/28). */
+:focus-visible {
+  outline: 2px solid theme("colors.rose.500");
+  outline-offset: 2px;
+}
+
+@layer utilities {
+  .container-ella {
+    @apply mx-auto w-full max-w-8xl px-4 sm:px-6 lg:px-8;
+  }
+
+  .line-clamp-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+}
